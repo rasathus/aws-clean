@@ -8,6 +8,9 @@ assertions:
   account_id: "012345678901"
   account_alias: your-account-iam-alias
   iam_username: your-iam-username
+  regions:
+    - us-east-2
+    - us-east-1
 
 # Resources that should not be deleted
 preserved_resources:

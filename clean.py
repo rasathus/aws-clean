@@ -54,8 +54,8 @@ class Cleaner:
         deletables = self._get_deletable_resources(describe_function, describe_args, preserve_key, list_key, item_key, filter_function)
         self._delete_generic_resource(deletables, list_key, delete_function, item_key)
 
-    def run_safety_checks(self, sts, iam, iam_resource):
-        # AWS Account ID in config.yml must match the account we are accessing using an API key
+    def run_safety_checks(self, sts, iam, iam_resource, aws_regions_list):
+        # AWS Account ID in config.yml must match the account we are accessing using an API key (if null then use only account_aliases)
         account_id = sts.get_caller_identity().get("Account")
         assert account_id == self.config.get("assertions").get("account_id"), "Unexpected AWS Account ID, check configuration!"
 
@@ -69,7 +69,7 @@ class Cleaner:
         current_user = iam_resource.CurrentUser().user_name
         assert current_user == self.config.get("assertions").get("iam_username"), "Unexpected IAM User name, check configuration!"
 
-        print("You are {} on account {} ({})".format(current_user, account_id, account_alias))
+        print("You are {} on account {} ({}) and included regions are {}".format(current_user, account_id, account_alias, aws_regions_list))
         if not self._ask("Proceed?", "no"): sys.exit()
 
     def delete_cloudformation_stacks(self, cf):
@@ -104,9 +104,9 @@ class Cleaner:
 
     def delete_cloudwatch_alarms(self, cloudwatch):
         alarms = cloudwatch.describe_alarms()
-        alarms_to_delete = [alarm.get("AlarmName") 
+        alarms_to_delete = [alarm.get("AlarmName")
             for alarm in alarms.get("MetricAlarms")
-            if alarm.get("AlarmName") 
+            if alarm.get("AlarmName")
             not in self.config.get("preserved_resources", {}).get("cloudwatch_alarms", [])]
         if alarms_to_delete:
             print("Alarms that will be deleted:", alarms_to_delete)
@@ -118,6 +118,7 @@ class Cleaner:
     def delete_buckets(self, s3, s3_resource):
         def delete_bucket_and_its_objects(Name):
             bucket = s3_resource.Bucket(Name)
+            print("Bucket name: {}".format(bucket))
             bucket.object_versions.delete()
             bucket.delete()
         self._simple_delete(s3.list_buckets, delete_bucket_and_its_objects, "s3_buckets", "Buckets", "Name")
@@ -126,11 +127,11 @@ class Cleaner:
         def not_default(resource):
             return resource["GroupName"] != "default"
         self._simple_delete(
-            ec2.describe_security_groups, 
-            ec2.delete_security_group, 
-            "securitygroups", 
-            "SecurityGroups", 
-            "GroupId", 
+            ec2.describe_security_groups,
+            ec2.delete_security_group,
+            "securitygroups",
+            "SecurityGroups",
+            "GroupId",
             filter_function=not_default
         )
 
@@ -144,33 +145,45 @@ def _get_config_from_file(filename):
         config = yaml.load(stream)
     return config
 
-def get_boto_session(profile_name):
+def get_boto_session(profile_name, aws_region):
     import boto3
-    return boto3.Session(profile_name=profile_name)
+    return boto3.Session(profile_name=profile_name, region_name=aws_region)
 
 if __name__ == "__main__":
     config = _get_config_from_file(sys.argv[1])
     cleaner = Cleaner(config)
     print("Current configuration:\n", yaml.dump(config, default_flow_style=False))
+    # Get all AWS regions
+    aws_regions_list = config.get("assertions").get("regions", [])
+    print("Running against regions: {}".format(aws_regions_list))
 
-    boto_session = get_boto_session(config["profile_name"])
-
-    cf = boto_session.client("cloudformation")
-    cloudwatch = boto_session.client("cloudwatch")
-    ec2 = boto_session.client("ec2")
-    iam = boto_session.client("iam")
+    # Query IAM and execute run_safety_checks
+    default_aws_region = "us-east-1" # This is just used to perform initial checks.  Its the prefered region to use as STS access cannot be disabled.
+    boto_session = get_boto_session(config["profile_name"], default_aws_region)
+    iam = boto_session.client("iam", region_name=default_aws_region)
     iam_resource = boto_session.resource("iam")
-    s3 = boto_session.client("s3")
-    s3_resource = boto_session.resource("s3")
-    sts = boto_session.client("sts")
-    sns = boto_session.client("sns")
+    sts = boto_session.client("sts", region_name=default_aws_region)
+    cleaner.run_safety_checks(sts, iam, iam_resource, aws_regions_list)
 
-    cleaner.run_safety_checks(sts, iam, iam_resource)
-    cleaner.delete_cloudformation_stacks(cf)
-    cleaner.delete_cloudwatch_alarms(cloudwatch)
-    cleaner.delete_sns_topics(sns)
-    cleaner.delete_amis(sts, ec2)
-    cleaner.delete_snapshots(sts, ec2)
-    cleaner.delete_securitygroups(ec2)
-    cleaner.delete_key_pairs(ec2)
+    # Execute for each AWS region
+    for aws_region in aws_regions_list:
+        print("== Performing Deletions in Region: {}".format(aws_region))
+        boto_session = get_boto_session(config["profile_name"], aws_region)
+        cf = boto_session.client("cloudformation", region_name=aws_region)
+        cloudwatch = boto_session.client("cloudwatch", region_name=aws_region)
+        ec2 = boto_session.client("ec2", region_name=aws_region)
+        iam = boto_session.client("iam", region_name=aws_region)
+        s3_resource = boto_session.resource("s3", region_name=default_aws_region)
+        sts = boto_session.client("sts", region_name=aws_region)
+        sns = boto_session.client("sns", region_name=aws_region)
+
+        cleaner.delete_cloudformation_stacks(cf)
+        cleaner.delete_cloudwatch_alarms(cloudwatch)
+        cleaner.delete_sns_topics(sns)
+        cleaner.delete_amis(sts, ec2)
+        cleaner.delete_snapshots(sts, ec2)
+        cleaner.delete_securitygroups(ec2)
+        cleaner.delete_key_pairs(ec2)
+
+    s3 = boto_session.client("s3", region_name=default_aws_region)
     cleaner.delete_buckets(s3, s3_resource)
